@@ -5,7 +5,8 @@
     [clojure.data.codec.base64 :as b64])
   (:import
     [java.lang String]
-    [java.io FileReader]))
+    [java.io FileReader]
+    [java.util.concurrent Executors]))
 
 (def log-level :info)
 
@@ -98,26 +99,41 @@
           "message was:" (.getMessage e))
         (transmit-result task
           {:status "FAILURE"
-           :traceback (.getStackTrace e)
+           :traceback (map (fn [x] (.toString x)) (.getStackTrace e))
            :result (.getMessage e)
            :children [] }
           config))))))
 
 
 (def default-config {
-  :threads 4
+  :thread-count (.availableProcessors (Runtime/getRuntime))
   :queue-name "celery"
   :result-serializer "json"
   :queue-poll-interval 500 ; time between polling in milliseconds
   :redis-conn {
-      :pool {}
-      :spec { :host "127.0.0.1" :port 6379 }}})
+    :pool {}
+    :spec { :host "127.0.0.1" :port 6379 }}})
 
 (defn start-worker [config]
-  (log :info "Worker booted!")
+  "Initalize a worker (per celery's terminology, a worker is a group of 
+  concurrent task executors) with a given config"
+
+  (log :info "Starting worker with the following settings:")
+  (log :info "Threads (concurrency):" (:thread-count config))
+  (log :info "Registered Tasks:")
+  (dorun (for [[task task-fn] (:task-map config)]
+    (log :info " - " task)))
+
+  (log :info "\nWorker booted!")
+
   (let [running (atom true)
-      working-config (merge default-config config)]
-    (fetch-and-execute running working-config)))
+      working-config (merge default-config config)
+      thread-pool (Executors/newFixedThreadPool (:thread-count config))
+      futures (.invokeAll thread-pool 
+        (for [_ (range (:thread-count config))]
+          (fn [] (fetch-and-execute running working-config))))]
+    (doseq [future futures]
+      (.get future))))
 
 (defn -main 
   ([]
@@ -133,4 +149,4 @@
       (let [task-map-symbol (str path "." module "/" task-map)
           working-settings (assoc settings 
             :task-map (eval (read-string task-map-symbol)))]
-        (start-worker working-settings)))))
+        (start-worker (merge default-config working-settings))))))

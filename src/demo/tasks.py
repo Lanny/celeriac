@@ -8,7 +8,11 @@ app.conf.update(
 
 @app.task
 def add(a, b):
-    return a + b
+    raise NotImplementedError()
+
+@app.task
+def slow_add(a, b):
+    raise NotImplementedError()
 
 if __name__ == '__main__':
     tasks = []

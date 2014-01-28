@@ -1,0 +1,6 @@
+{
+  "broker": "redis",
+  "results-backend": "redis",
+  "task-set": ["demo" "tasks" "task-map"],
+  "queue-name": "celery"
+}

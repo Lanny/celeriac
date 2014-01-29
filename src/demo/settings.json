@@ -1,6 +1,7 @@
 {
   "broker": "redis",
   "results-backend": "redis",
+  "task-serializer": "json",
   "task-set": ["demo" "tasks" "task-map"],
   "queue-name": "celery"
 }

@@ -6,9 +6,10 @@
   (:import
     [java.lang String]
     [java.io FileReader]
+    [java.util UUID]
     [java.util.concurrent Executors]))
 
-(def log-level :info)
+(def log-level :debug)
 
 (def log-levels {
   :debug 0
@@ -22,17 +23,38 @@
     (apply println message)))
 
 ; LIVE BY STRATEGY DIE BY STRATEGY!!!
-(def task-decoders {
+(def task-deserializers {
   "application/json" (fn [body encoding]
     (json/read-str
       (String.
         (b64/decode
           (.getBytes body "UTF-8")) encoding) :key-fn keyword))})
 
+(def task-serializers {
+  "json" (fn [task]
+    (json/write-str {
+      :properties {
+        :body-encoding "base64"
+        :correlation_id (str (UUID/randomUUID))
+        :reply_to nil ; Whelp, I have no idea what this is supposed to do
+        :delivery_mode 2
+        :delivery_tag 1
+        :delivery_info {
+          :priority 0 ; Oh look, more stuff I'm ignoring
+          :routing_key "celery"
+          :exchange "celery" }}
+      :headers {}
+      :content-type "application/json"
+      :content-encoding "UTF-8"
+      :body (String.
+        (b64/encode
+          (.getBytes
+            (json/write-str task))) "UTF-8") })) })
+
 (def result-serializers {
   "json" json/write-str })
 
-(def result-transmitters {
+(def result-backends {
   "redis" (fn [task result config]
     (let [{conn :redis-conn serializer-name :result-serializer queue :queue-name} config
         serializer (get result-serializers serializer-name)]
@@ -40,6 +62,33 @@
         (car/set (str queue "-task-meta-" (:id task))
           (serializer result)))))
 })
+
+(def broker-writers {
+  "redis" (fn [task config]
+    (let [serializer (get task-serializers (:task-serializer config))
+        queue (or (:queue task) "celery")]
+      (car/wcar (:redis-conn config)
+        (car/rpush queue (serializer task))))) })
+
+(defn apply-async [task-name config &{:keys [args kwargs queue callbacks]
+    :or {args [] kwargs {} queue "celery" callbacks nil}}]
+  "A convienience function for generating task maps with defaults and sending
+  them off to the queue"
+  ; totally doesn't work yet
+  {:body 
+    {:chord nil 
+     :id (str (UUID/randomUUID))
+     :retries 0
+     :args args
+     :expires nil
+     :timelimit [nil nil]
+     :taskset nil
+     :task task-name
+     :callbacks callbacks
+     :kwargs kwargs
+     :errbacks nil
+     :utc true}
+  })
 
 (defn get-redis-task [running {conn :redis-conn queue :queue-name interval :queue-poll-interval}]
   "Fetches, deserializes, and returns a task from a redis queue. Will block
@@ -51,7 +100,7 @@
           (Thread/sleep interval) 
           (if (deref running) (recur) nil))
         (let [message (json/read-str raw-message :key-fn keyword)
-            decoder (get task-decoders (:content-type message))]
+            decoder (get task-deserializers (:content-type message))]
           (log :info "Got a message from the broker.")
           (log :debug "And the contents of that message are:\n" message)
 
@@ -79,7 +128,7 @@
   broker, rinse, and repeat."
   (while (deref running)
     (let [{ task :task m-data :meta } (get-redis-task running config)
-        transmit-result (get result-transmitters (:results-backend config))]
+        transmit-result (get result-backends (:results-backend config))]
       (try 
         (log :debug "Got task, full body is:\n" task)
 
@@ -92,18 +141,31 @@
              :traceback nil
              :result result
              :children [] }
-            config))
+            config)
+
+          (if (seq (:callbacks task))
+            (doall (for [cb (:callbacks task)]
+              (let [broker-writer (get broker-writers (:broker config))]
+                (broker-writer ; If task isn't immutable, add result to args
+                  (if (:immutable task)
+                    (assoc cb :id (:task_id (:options cb)))
+                    (merge cb 
+                      {:args (into (:args cb) [result]) 
+                       :id (:task_id (:options cb)) })) 
+                  config))))))
 
       (catch Exception e
         (log :error "Exception occurred wile executing a task. Original "
           "message was:" (.getMessage e))
+        (log :info "Stack trace on that was: " 
+          (map (fn [x] (str (.toString x) "\n")) (.getStackTrace e)))
+
         (transmit-result task
           {:status "FAILURE"
            :traceback (map (fn [x] (.toString x)) (.getStackTrace e))
            :result (.getMessage e)
            :children [] }
           config))))))
-
 
 (def default-config {
   :thread-count (.availableProcessors (Runtime/getRuntime))

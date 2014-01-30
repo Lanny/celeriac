@@ -27,9 +27,11 @@ def make_spanish(s):
     raise NotImplementedError()
 
 if __name__ == '__main__':
-    s = "I'm not sure this is how languages work"
-    result = chain(make_spanish.subtask(args=(s,), queue="celery"), 
-        make_japaneese.subtask(queue="celery"))().get()
+    #s = "I'm not sure this is how languages work"
+    #result = chain(make_spanish.subtask(args=(s,), queue="celery"), 
+    #    make_japaneese.subtask(queue="celery"))().get()
 
-    print result
+    #print result
+    g = group(*[slow_add.si(1, 2) for _ in range(10)])
+    print g().get()
 

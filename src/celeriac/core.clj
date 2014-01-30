@@ -7,9 +7,9 @@
     [java.lang String]
     [java.io FileReader]
     [java.util UUID]
-    [java.util.concurrent Executors]))
+    [java.util.concurrent Executors LinkedBlockingDeque]))
 
-(def log-level :debug)
+(def log-level :info)
 
 (def log-levels {
   :debug 0
@@ -63,6 +63,17 @@
           (serializer result)))))
 })
 
+(def broker-consumers 
+  "Strategizes the retreival of a task from the broker. All functions here take
+  a queue name, timeout (in seconds), and a config and return a task if one is 
+  available or nil if one is not within the timeout. The raw task is returned,
+  so it'll probably be a string. No effort to deserialize is made."
+  {
+    "redis" (fn [queue timeout config]
+      (last (car/wcar (:redis-conn config) 
+        (car/brpop queue timeout))))
+  })
+
 (def broker-writers {
   "redis" (fn [task config]
     (let [serializer (get task-serializers (:task-serializer config))
@@ -90,25 +101,44 @@
      :utc true}
   })
 
-(defn get-redis-task [running {conn :redis-conn queue :queue-name interval :queue-poll-interval}]
-  "Fetches, deserializes, and returns a task from a redis queue. Will block
-  until one is available if the queue is empty"
-  (loop []
-    (let [raw-message (car/wcar conn (car/lpop queue))]
-      (if-not raw-message
-        (do 
-          (Thread/sleep interval) 
-          (if (deref running) (recur) nil))
-        (let [message (json/read-str raw-message :key-fn keyword)
-            decoder (get task-deserializers (:content-type message))]
-          (log :info "Got a message from the broker.")
-          (log :debug "And the contents of that message are:\n" message)
+(defn consume-to-queue [internal-queue running config]
+  "Polls the broker, per config, continuously as long as running derefs true and
+  and internal-queue is not full. Handles decoding the task."
+  (let [consume (get broker-consumers (:broker config))]
+    (while @running
+      ; Even if we have capacity, don't take new tasks if we're shutting down
+      (while (and (> (.remainingCapacity internal-queue) 0) @running)
+        (let [raw-message (consume (:queue-name config) 
+            (:queue-poll-interval config) config)]
+          (if raw-message
+            ; If timeout is hit raw-message is nil, loop, check if we're
+            ; shutting down, and repeat
+            (let [message (json/read-str raw-message :key-fn keyword)
+              decoder (get task-deserializers (:content-type message))]
+            (if-not decoder
+              (log :warn "Got task with unexpected content-type:" 
+                (:content-type message))
+              ; If everythign went well we push into the queue. In theory this
+              ; should never block since we checked if we have capasity earlier
+              (.offerLast internal-queue {
+                :meta message
+                :task (decoder
+                  (:body message) 
+                  (:content-encoding message))}))))))
 
-          (if-not decoder
-            (throw (Exception. (str "Task content-type '" decoder "' not supported."))))
+      ; If we're at capacity but still running then poll internal queue for cap.
+      (Thread/sleep 1000)))
 
-          {:meta message
-           :task (decoder (:body message) (:content-encoding message)) })))))
+  ; Once it's time to shut down we need to return our internally queued tasks 
+  ; to the broker
+  (let [return (get broker-writers (:broker config))]
+    (doall 
+      (for [t (iterator-seq (.iterator internal-queue))]
+        (return t config))))
+
+  ; And signal any workers waiting on this queue that it's time to pack up
+  (doall (for [_ (range (:thread-count config))]
+    (.put internal-queue {:terminate true}))))
 
 (defn execute-task [task config]
   "Take a task we just pulled off the wire, figure out which, if any, function
@@ -123,55 +153,58 @@
         (log :info "Task '" (:task task) "' finished in " run-time "seconds")
         result))))
 
-(defn fetch-and-execute [running config]
-  "Poll for a task until one comes through, execute it, give the result to the
-  broker, rinse, and repeat."
+(defn worker-loop [internal-queue running config]
+  "Consumes and executes tasks from internal-queue as long as running derefs 
+  true."
+  (log :debug "Worker loop started")
   (while (deref running)
-    (let [{ task :task m-data :meta } (get-redis-task running config)
+    (let [{ task :task m-data :meta terminate :terminate } (.takeLast internal-queue)
         transmit-result (get result-backends (:results-backend config))]
+      (log :info "Beginning execution of task:" (:task task))
+      (log :debug "Full body of that task being:\n" task)
+
       (try 
-        (log :debug "Got task, full body is:\n" task)
+        (if terminate nil ; Looks like it's closing time
+          (let [result (execute-task task config)]
+            (log :info "Completed task " (:id task) " of type " (:task task) 
+              " with result: " result)
 
-        (let [result (execute-task task config)]
-          (log :info "Completed task " (:id task) " of type " (:task task) 
-            " with result: " result)
+            (transmit-result task 
+              {:status "SUCCESS"
+               :traceback nil
+               :result result
+               :children [] }
+              config)
 
-          (transmit-result task 
-            {:status "SUCCESS"
-             :traceback nil
-             :result result
+            (if (seq (:callbacks task))
+              (doall (for [cb (:callbacks task)]
+                (let [broker-writer (get broker-writers (:broker config))]
+                  (broker-writer ; If task isn't immutable, add result to args
+                    (if (:immutable task)
+                      (assoc cb :id (:task_id (:options cb)))
+                      (merge cb 
+                        {:args (into (:args cb) [result]) 
+                         :id (:task_id (:options cb)) })) 
+                    config)))))))
+
+        (catch Exception e
+          (log :error "Exception occurred wile executing a task. Original "
+            "message was:" (.getMessage e))
+          (log :info "Stack trace on that was: " 
+            (map (fn [x] (str (.toString x) "\n")) (.getStackTrace e)))
+
+          (transmit-result task
+            {:status "FAILURE"
+             :traceback (map (fn [x] (.toString x)) (.getStackTrace e))
+             :result (.getMessage e)
              :children [] }
-            config)
-
-          (if (seq (:callbacks task))
-            (doall (for [cb (:callbacks task)]
-              (let [broker-writer (get broker-writers (:broker config))]
-                (broker-writer ; If task isn't immutable, add result to args
-                  (if (:immutable task)
-                    (assoc cb :id (:task_id (:options cb)))
-                    (merge cb 
-                      {:args (into (:args cb) [result]) 
-                       :id (:task_id (:options cb)) })) 
-                  config))))))
-
-      (catch Exception e
-        (log :error "Exception occurred wile executing a task. Original "
-          "message was:" (.getMessage e))
-        (log :info "Stack trace on that was: " 
-          (map (fn [x] (str (.toString x) "\n")) (.getStackTrace e)))
-
-        (transmit-result task
-          {:status "FAILURE"
-           :traceback (map (fn [x] (.toString x)) (.getStackTrace e))
-           :result (.getMessage e)
-           :children [] }
-          config))))))
+            config))))))
 
 (def default-config {
   :thread-count (.availableProcessors (Runtime/getRuntime))
   :queue-name "celery"
   :result-serializer "json"
-  :queue-poll-interval 500 ; time between polling in milliseconds
+  :queue-poll-interval 1 ; time between polling in seconds
   :redis-conn {
     :pool {}
     :spec { :host "127.0.0.1" :port 6379 }}})
@@ -190,10 +223,13 @@
 
   (let [running (atom true)
       working-config (merge default-config config)
-      thread-pool (Executors/newFixedThreadPool (:thread-count config))
-      futures (.invokeAll thread-pool 
-        (for [_ (range (:thread-count config))]
-          (fn [] (fetch-and-execute running working-config))))]
+      thread-pool (Executors/newFixedThreadPool 
+        (+ (:thread-count config) 1)) ; Add one for the consumer
+      internal-queue (LinkedBlockingDeque. (:thread-count working-config))
+      concurrent-executors (for [_ (range (:thread-count working-config))]
+        (fn [] (worker-loop internal-queue running working-config)))
+      consumer (fn [] (consume-to-queue internal-queue running working-config))
+      futures (.invokeAll thread-pool (conj concurrent-executors consumer))]
     (doseq [future futures]
       (.get future))))
 

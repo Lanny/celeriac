@@ -1,5 +1,6 @@
 {
   "broker": "redis",
+  "thread-count": 4,
   "results-backend": "redis",
   "task-serializer": "json",
   "task-set": ["demo" "tasks" "task-map"],
